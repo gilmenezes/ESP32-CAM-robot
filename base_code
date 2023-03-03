@@ -1,0 +1,478 @@
+#include "esp_camera.h"
+#include <WiFi.h>
+#include "esp_timer.h"
+#include "img_converters.h"
+#include "Arduino.h"
+#include "fb_gfx.h"
+#include "soc/soc.h"             // disable brownout problems
+#include "soc/rtc_cntl_reg.h"    // disable brownout problems
+#include "esp_http_server.h"
+#include <ESP32Servo.h>
+
+// Replace with your network credentials
+const char* ssid = "HEN-WIFI";
+const char* password = "D@lv@_HEN?";
+
+#define PART_BOUNDARY "123456789000000000000987654321"
+
+#define CAMERA_MODEL_AI_THINKER
+//#define CAMERA_MODEL_M5STACK_PSRAM
+//#define CAMERA_MODEL_M5STACK_WITHOUT_PSRAM
+//#define CAMERA_MODEL_M5STACK_PSRAM_B
+//#define CAMERA_MODEL_WROVER_KIT
+
+#if defined(CAMERA_MODEL_WROVER_KIT)
+#define PWDN_GPIO_NUM    -1
+#define RESET_GPIO_NUM   -1
+#define XCLK_GPIO_NUM    21
+#define SIOD_GPIO_NUM    26
+#define SIOC_GPIO_NUM    27
+
+#define Y9_GPIO_NUM      35
+#define Y8_GPIO_NUM      34
+#define Y7_GPIO_NUM      39
+#define Y6_GPIO_NUM      36
+#define Y5_GPIO_NUM      19
+#define Y4_GPIO_NUM      18
+#define Y3_GPIO_NUM       5
+#define Y2_GPIO_NUM       4
+#define VSYNC_GPIO_NUM   25
+#define HREF_GPIO_NUM    23
+#define PCLK_GPIO_NUM    22
+
+#elif defined(CAMERA_MODEL_M5STACK_PSRAM)
+#define PWDN_GPIO_NUM     -1
+#define RESET_GPIO_NUM    15
+#define XCLK_GPIO_NUM     27
+#define SIOD_GPIO_NUM     25
+#define SIOC_GPIO_NUM     23
+
+#define Y9_GPIO_NUM       19
+#define Y8_GPIO_NUM       36
+#define Y7_GPIO_NUM       18
+#define Y6_GPIO_NUM       39
+#define Y5_GPIO_NUM        5
+#define Y4_GPIO_NUM       34
+#define Y3_GPIO_NUM       35
+#define Y2_GPIO_NUM       32
+#define VSYNC_GPIO_NUM    22
+#define HREF_GPIO_NUM     26
+#define PCLK_GPIO_NUM     21
+
+#elif defined(CAMERA_MODEL_M5STACK_WITHOUT_PSRAM)
+#define PWDN_GPIO_NUM     -1
+#define RESET_GPIO_NUM    15
+#define XCLK_GPIO_NUM     27
+#define SIOD_GPIO_NUM     25
+#define SIOC_GPIO_NUM     23
+
+#define Y9_GPIO_NUM       19
+#define Y8_GPIO_NUM       36
+#define Y7_GPIO_NUM       18
+#define Y6_GPIO_NUM       39
+#define Y5_GPIO_NUM        5
+#define Y4_GPIO_NUM       34
+#define Y3_GPIO_NUM       35
+#define Y2_GPIO_NUM       17
+#define VSYNC_GPIO_NUM    22
+#define HREF_GPIO_NUM     26
+#define PCLK_GPIO_NUM     21
+
+#elif defined(CAMERA_MODEL_AI_THINKER)
+#define PWDN_GPIO_NUM     32
+#define RESET_GPIO_NUM    -1
+#define XCLK_GPIO_NUM      0
+#define SIOD_GPIO_NUM     26
+#define SIOC_GPIO_NUM     27
+
+#define Y9_GPIO_NUM       35
+#define Y8_GPIO_NUM       34
+#define Y7_GPIO_NUM       39
+#define Y6_GPIO_NUM       36
+#define Y5_GPIO_NUM       21
+#define Y4_GPIO_NUM       19
+#define Y3_GPIO_NUM       18
+#define Y2_GPIO_NUM        5
+#define VSYNC_GPIO_NUM    25
+#define HREF_GPIO_NUM     23
+#define PCLK_GPIO_NUM     22
+
+#elif defined(CAMERA_MODEL_M5STACK_PSRAM_B)
+#define PWDN_GPIO_NUM     -1
+#define RESET_GPIO_NUM    15
+#define XCLK_GPIO_NUM     27
+#define SIOD_GPIO_NUM     22
+#define SIOC_GPIO_NUM     23
+
+#define Y9_GPIO_NUM       19
+#define Y8_GPIO_NUM       36
+#define Y7_GPIO_NUM       18
+#define Y6_GPIO_NUM       39
+#define Y5_GPIO_NUM        5
+#define Y4_GPIO_NUM       34
+#define Y3_GPIO_NUM       35
+#define Y2_GPIO_NUM       32
+#define VSYNC_GPIO_NUM    25
+#define HREF_GPIO_NUM     26
+#define PCLK_GPIO_NUM     21
+
+#else
+#error "Camera model not selected"
+#endif
+
+#define SERVO_1      14
+#define SERVO_2      15
+#define SERVO_3      12
+
+#define SERVO_STEP   5
+
+Servo servoN1;
+Servo servoN2;
+Servo servoN3;
+Servo servo1;
+Servo servo2;
+Servo servo3;
+
+int servo1Pos = 10;
+int servo2Pos = 90;
+int servo3Pos = 80;
+
+static const char* _STREAM_CONTENT_TYPE = "multipart/x-mixed-replace;boundary=" PART_BOUNDARY;
+static const char* _STREAM_BOUNDARY = "\r\n--" PART_BOUNDARY "\r\n";
+static const char* _STREAM_PART = "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n";
+
+httpd_handle_t camera_httpd = NULL;
+httpd_handle_t stream_httpd = NULL;
+
+static const char PROGMEM INDEX_HTML[] = R"rawliteral(
+<html>
+  <head>
+    <title>ESP32-CAM Robot</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+      body { font-family: Arial; text-align: center; margin:0px auto; padding-top: 30px;}
+      table { margin-left: auto; margin-right: auto; }
+      td { padding: 8 px; }
+      .button {
+        background-color: #2f4468;
+        border: none;
+        color: white;
+        padding: 10px 20px;
+        text-align: center;
+        text-decoration: none;
+        display: inline-block;
+        font-size: 18px;
+        margin: 6px 3px;
+        cursor: pointer;
+        -webkit-touch-callout: none;
+        -webkit-user-select: none;
+        -khtml-user-select: none;
+        -moz-user-select: none;
+        -ms-user-select: none;
+        user-select: none;
+        -webkit-tap-highlight-color: rgba(0,0,0,0);
+      }
+      img {  width: auto ;
+        max-width: 100% ;
+        height: auto ; 
+      }
+    </style>
+  </head>
+  <body>
+    <h1>DALVA WEB SERVER - Base</h1>
+    <tr><img src="data:image/svg+xml;base64,PD94bWwgdmVyc2lvbj0iMS4wIiBlbmNvZGluZz0idXRmLTgiPz4NCjwhLS0gR2VuZXJhdG9yOiBBZG9iZSBJbGx1c3RyYXRvciAxNi4wLjAsIFNWRyBFeHBvcnQgUGx1Zy1JbiAuIFNWRyBWZXJzaW9uOiA2LjAwIEJ1aWxkIDApICAtLT4NCjwhRE9DVFlQRSBzdmcgUFVCTElDICItLy9XM0MvL0RURCBTVkcgMS4xLy9FTiIgImh0dHA6Ly93d3cudzMub3JnL0dyYXBoaWNzL1NWRy8xLjEvRFREL3N2ZzExLmR0ZCI+DQo8c3ZnIHZlcnNpb249IjEuMSIgaWQ9IkxheWVyXzEiIHhtbG5zPSJodHRwOi8vd3d3LnczLm9yZy8yMDAwL3N2ZyIgeG1sbnM6eGxpbms9Imh0dHA6Ly93d3cudzMub3JnLzE5OTkveGxpbmsiIHg9IjBweCIgeT0iMHB4Ig0KCSB3aWR0aD0iODQxLjg5cHgiIGhlaWdodD0iMjI0LjU3MXB4IiB2aWV3Qm94PSIwIDAgODQxLjg5IDIyNC41NzEiIGVuYWJsZS1iYWNrZ3JvdW5kPSJuZXcgMCAwIDg0MS44OSAyMjQuNTcxIg0KCSB4bWw6c3BhY2U9InByZXNlcnZlIj4NCjxnPg0KCTxnPg0KCQk8cG9seWdvbiBwb2ludHM9IjU2Ni43NTIsMTUwLjI3NiA1NjQuNDI3LDE1MC4yNzYgNTAyLjkxOSwxNTAuMjc2IDUwMi45MTksNDUuMTUgNTAyLjkxOSw0NS4xNDggNDk5LjMxOCw0NS4xNDggNDk5LjMxOCw0NS4xMDEgDQoJCQk0NzMuMzk1LDQ1LjEwMSA0NzMuMzk1LDE3Ny41NDkgNDc2Ljk5NCwxNzcuNTQ5IDQ3Ni45OTQsMTc3LjU5OSA1NjYuNzUyLDE3Ny41OTkgNTY2Ljc1MiwxNzcuNTQ5IAkJIi8+DQoJCTxwYXRoIGQ9Ik03OTYuNTcxLDE3Ny41NDlsLTAuNDQ3LTEuMjNMNzQ4LjM5LDQ1LjEwMWgtMzcuNjEybC00Ny43MzIsMTMxLjIxOGwtMC40NDcsMS4yM2g0LjE0bC0wLjA5MiwwLjI1M2wyNy4yNDUtMC4wODcNCgkJCWwxMC45MzktMzIuMzM4bDQ5LjcyOS0wLjE2MmwxMS4xNTEsMzIuMjY2bDMuNTYyLTAuMDEybDAuMDI4LDAuMDhINzk2LjU3MXogTTcxMy44OSwxMTguODAxbDEuOTAzLTUuNjY4DQoJCQljMy44NTYtMTEuMTgxLDguNDE4LTI1LjM2NywxMy41ODYtNDIuMjU2YzMuNjgxLDExLjUwNiw4LjM3MywyNS42MjcsMTQuMDA2LDQyLjE2bDEuOTQxLDUuNjYxTDcxMy44OSwxMTguODAxeiIvPg0KCQk8cGF0aCBkPSJNNjgwLjE4MSw0Ni4yMjFsMC4zNjgtMS4xMjFoLTI2LjY3NGwtMC4wMTYsMC4wNDhoLTMuNzdMNjMyLjQxMSw5OS4yOGMtNC45NDYsMTUuMzEzLTkuMzU3LDI5LjkxNy0xMy4xNjIsNDMuNTc2DQoJCQljLTQuNTQ1LTE2LjE3OS05LjAwNi0zMC44MDYtMTMuMzAyLTQzLjYwNGwtMTcuNjctNTQuMTAzaC0zLjc3MWwtMC4wMTctMC4wNDhoLTI2LjY2OGwwLjM2OCwxLjEyNGw0My4xNjEsMTMxLjMyNWgzLjY1Ng0KCQkJbDAuMDE5LDAuMDQ5aDI4LjM4OWwwLjAxNy0wLjA0OWgzLjc3NEw2ODAuMTgxLDQ2LjIyMXoiLz4NCgkJPHBhdGggZD0iTTQ2MC43OTksMTc2LjMxOUw0MTMuMDY1LDQ1LjEwMWgtMzcuNjEybC00Ny43MzIsMTMxLjIxOGwtMC40NDgsMS4yM2gzLjg0OWwtMC4wMTgsMC4wNDloMjcuMjQ0bDExLjA0Ni0zMi4zMDNoNDkuNzMNCgkJCWwxMS4wNDUsMzIuMzAzaDI3LjI0NWwtMC4wMTktMC4wNDloMy44NUw0NjAuNzk5LDE3Ni4zMTl6IE0zNzguNTQyLDExOC43NDlsMS45MTktNS42NjFjMy44OTMtMTEuMTYyLDguNTAxLTI1LjMzMywxMy43MjYtNDIuMjExDQoJCQljMy42NDQsMTEuNTE4LDguMjg5LDI1LjY1NCwxMy44NjksNDIuMjA1bDEuOTIzLDUuNjY3SDM3OC41NDJ6Ii8+DQoJCTxwYXRoIGQ9Ik0yMDcuODU3LDE3Ny41OTlWNDUuMTVoNDYuODc4YzIyLjY5NSwwLDQwLjE0OSw1LjczNyw1Mi4zNjYsMTcuMjA3YzEyLjIxMiwxMS40NzMsMTguMzIzLDI3LjgxMSwxOC4zMjMsNDkuMDE4DQoJCQljMCwyMS4yMDctNi4xMTEsMzcuNTQ3LTE4LjMyMyw0OS4wMTdjLTEyLjIxNywxMS40NzItMjkuNjcxLDE3LjIwOC01Mi4zNjYsMTcuMjA4SDIwNy44NTd6IE0yNTcuNjMsNzIuNDk0aC0yMC4wNDZ2NzcuNzU5aDIwLjA0Ng0KCQkJYzI1LjI5NywwLDM3Ljk0OC0xMi45NTgsMzcuOTQ4LTM4Ljg3OEMyOTUuNTc4LDg1LjQ1NiwyODIuOTI3LDcyLjQ5NCwyNTcuNjMsNzIuNDk0eiIvPg0KCTwvZz4NCgk8cGF0aCBmaWxsPSIjM0VGRjk0IiBkPSJNMTc0LjA3MiwxMTEuMDkxYy00OC42MDgsOS43MjEtNTYuNDg4LDE3LjYtNjYuMjA4LDY2LjIwOGMtOS43MjEtNDguNjA4LTE3LjYtNTYuNDg3LTY2LjIwOC02Ni4yMDgNCgkJYzQ4LjYwNy05LjcxOSw1Ni40ODctMTcuNTk5LDY2LjIwOC02Ni4yMDdDMTE3LjU4NCw5My40OTIsMTI1LjQ2MywxMDEuMzcyLDE3NC4wNzIsMTExLjA5MXoiLz4NCjwvZz4NCjwvc3ZnPg0K"></tr>
+    <tr></tr>
+    <tr><img src="" id="photo" ></tr>
+    <table>
+      <tr><td colspan="3" align="center"><button class="button" onmousedown="toggleCheckbox('up');" ontouchstart="toggleCheckbox('up');">Subir torre </button></td></tr>
+      <tr><td align="center"><button class="button" onmousedown="toggleCheckbox('left');" ontouchstart="toggleCheckbox('left');">Apertar Nema</button></td><td align="center"></td><td align="center"><button class="button" onmousedown="toggleCheckbox('right');" ontouchstart="toggleCheckbox('right');">Soltar NEMA</button></td></tr>
+      <tr><td align="center"><button class="button" onmousedown="toggleCheckbox('lefta');" ontouchstart="toggleCheckbox('lefta');">Apertar Base</button></td><td align="center"></td><td align="center"><button class="button" onmousedown="toggleCheckbox('righta');" ontouchstart="toggleCheckbox('righta');">Soltar Base</button></td></tr>
+      <tr><td colspan="3" align="center"><button class="button" onmousedown="toggleCheckbox('down');" ontouchstart="toggleCheckbox('down');">Descer torre </button></td></tr>                   
+    </table>
+   <script>
+   function toggleCheckbox(x) {
+     var xhr = new XMLHttpRequest();
+     xhr.open("GET", "/action?go=" + x, true);
+     xhr.send();
+   }
+   window.onload = document.getElementById("photo").src = window.location.href.slice(0, -1) + ":81/stream";
+  </script>
+  </body>
+</html>
+)rawliteral";
+
+static esp_err_t index_handler(httpd_req_t *req){
+  httpd_resp_set_type(req, "text/html");
+  return httpd_resp_send(req, (const char *)INDEX_HTML, strlen(INDEX_HTML));
+}
+
+static esp_err_t stream_handler(httpd_req_t *req){
+  camera_fb_t * fb = NULL;
+  esp_err_t res = ESP_OK;
+  size_t _jpg_buf_len = 0;
+  uint8_t * _jpg_buf = NULL;
+  char * part_buf[64];
+
+  res = httpd_resp_set_type(req, _STREAM_CONTENT_TYPE);
+  if(res != ESP_OK){
+    return res;
+  }
+
+  while(true){
+    fb = esp_camera_fb_get();
+    if (!fb) {
+      Serial.println("Camera capture failed");
+      res = ESP_FAIL;
+    } else {
+      if(fb->width > 400){
+        if(fb->format != PIXFORMAT_JPEG){
+          bool jpeg_converted = frame2jpg(fb, 80, &_jpg_buf, &_jpg_buf_len);
+          esp_camera_fb_return(fb);
+          fb = NULL;
+          if(!jpeg_converted){
+            Serial.println("JPEG compression failed");
+            res = ESP_FAIL;
+          }
+        } else {
+          _jpg_buf_len = fb->len;
+          _jpg_buf = fb->buf;
+        }
+      }
+    }
+    if(res == ESP_OK){
+      size_t hlen = snprintf((char *)part_buf, 64, _STREAM_PART, _jpg_buf_len);
+      res = httpd_resp_send_chunk(req, (const char *)part_buf, hlen);
+    }
+    if(res == ESP_OK){
+      res = httpd_resp_send_chunk(req, (const char *)_jpg_buf, _jpg_buf_len);
+    }
+    if(res == ESP_OK){
+      res = httpd_resp_send_chunk(req, _STREAM_BOUNDARY, strlen(_STREAM_BOUNDARY));
+    }
+    if(fb){
+      esp_camera_fb_return(fb);
+      fb = NULL;
+      _jpg_buf = NULL;
+    } else if(_jpg_buf){
+      free(_jpg_buf);
+      _jpg_buf = NULL;
+    }
+    if(res != ESP_OK){
+      break;
+    }
+    //Serial.printf("MJPG: %uB\n",(uint32_t)(_jpg_buf_len));
+  }
+  return res;
+}
+
+static esp_err_t cmd_handler(httpd_req_t *req){
+  char*  buf;
+  size_t buf_len;
+  char variable[32] = {0,};
+  
+  buf_len = httpd_req_get_url_query_len(req) + 1;
+  if (buf_len > 1) {
+    buf = (char*)malloc(buf_len);
+    if(!buf){
+      httpd_resp_send_500(req);
+      return ESP_FAIL;
+    }
+    if (httpd_req_get_url_query_str(req, buf, buf_len) == ESP_OK) {
+      if (httpd_query_key_value(buf, "go", variable, sizeof(variable)) == ESP_OK) {
+      } else {
+        free(buf);
+        httpd_resp_send_404(req);
+        return ESP_FAIL;
+      }
+    } else {
+      free(buf);
+      httpd_resp_send_404(req);
+      return ESP_FAIL;
+    }
+    free(buf);
+  } else {
+    httpd_resp_send_404(req);
+    return ESP_FAIL;
+  }
+
+  sensor_t * s = esp_camera_sensor_get();
+  //flip the camera vertically
+  //s->set_vflip(s, 1);          // 0 = disable , 1 = enable
+  // mirror effect
+  //s->set_hmirror(s, 1);          // 0 = disable , 1 = enable
+
+  int res = 0;
+  
+  if(!strcmp(variable, "down")) {
+    if(servo1Pos <= 170) {
+      servo1Pos += 10;
+      servo1.write(servo1Pos);
+    }
+    Serial.println(servo1Pos);
+    Serial.println("down");
+  }
+   else if(!strcmp(variable, "left")) {
+    if(servo2Pos <= 170) {
+      servo2Pos += 10;
+      servo2.write(servo2Pos);
+    }
+    Serial.println(servo2Pos);
+    Serial.println("Left");
+  }
+  else if(!strcmp(variable, "right")) {
+    if(servo2Pos >= 10) {
+      servo2Pos -= 10;
+      servo2.write(servo2Pos);
+    }
+    Serial.println(servo2Pos);
+    Serial.println("Right");
+  }
+// novo servo add 
+   else if(!strcmp(variable, "lefta")) {
+    if(servo3Pos <= 170) {
+      servo3Pos += 10;
+      servo3.write(servo3Pos);
+    }
+    Serial.println(servo3Pos);
+    Serial.println("Left");
+  }
+  // novo servo add 
+  else if(!strcmp(variable, "righta")) {
+    if(servo3Pos >= 10) {
+      servo3Pos -= 10;
+      servo3.write(servo3Pos);
+    }
+    Serial.println(servo3Pos);
+    Serial.println("Right");
+  }
+ else if(!strcmp(variable, "up")) {
+  //if(!strcmp(variable, "down")) {
+    if(servo1Pos >= 10) {
+      servo1Pos -= 10;
+      servo1.write(servo1Pos);
+    }
+    Serial.println(servo1Pos);
+    Serial.println("up");
+  }
+  else {
+    res = -1;
+  }
+
+  if(res){
+    return httpd_resp_send_500(req);
+  }
+
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+  return httpd_resp_send(req, NULL, 0);
+}
+
+void startCameraServer(){
+  httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+  config.server_port = 80;
+  httpd_uri_t index_uri = {
+    .uri       = "/",
+    .method    = HTTP_GET,
+    .handler   = index_handler,
+    .user_ctx  = NULL
+  };
+
+  httpd_uri_t cmd_uri = {
+    .uri       = "/action",
+    .method    = HTTP_GET,
+    .handler   = cmd_handler,
+    .user_ctx  = NULL
+  };
+  httpd_uri_t stream_uri = {
+    .uri       = "/stream",
+    .method    = HTTP_GET,
+    .handler   = stream_handler,
+    .user_ctx  = NULL
+  };
+  if (httpd_start(&camera_httpd, &config) == ESP_OK) {
+    httpd_register_uri_handler(camera_httpd, &index_uri);
+    httpd_register_uri_handler(camera_httpd, &cmd_uri);
+  }
+  config.server_port += 1;
+  config.ctrl_port += 1;
+  if (httpd_start(&stream_httpd, &config) == ESP_OK) {
+    httpd_register_uri_handler(stream_httpd, &stream_uri);
+  }
+}
+
+void setup() {
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0); //disable brownout detector
+  servo1.setPeriodHertz(50);    // standard 50 hz servo
+  servo2.setPeriodHertz(50);    // standard 50 hz servo
+  servo3.setPeriodHertz(50);    // standard 50 hz servo
+  servoN1.attach(2, 1000, 2000);
+  servoN2.attach(13, 1000, 2000);
+  servoN3.attach(4, 1000, 2000);
+  
+  servo1.attach(SERVO_1, 1000, 2000);
+  servo2.attach(SERVO_2, 1000, 2000);
+  servo3.attach(SERVO_3, 1000, 2000);
+  
+  servo1.write(servo1Pos);
+  servo2.write(servo2Pos);
+  servo3.write(servo3Pos);
+  
+  Serial.begin(115200);
+  Serial.setDebugOutput(false);
+  
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer = LEDC_TIMER_0;
+  config.pin_d0 = Y2_GPIO_NUM;
+  config.pin_d1 = Y3_GPIO_NUM;
+  config.pin_d2 = Y4_GPIO_NUM;
+  config.pin_d3 = Y5_GPIO_NUM;
+  config.pin_d4 = Y6_GPIO_NUM;
+  config.pin_d5 = Y7_GPIO_NUM;
+  config.pin_d6 = Y8_GPIO_NUM;
+  config.pin_d7 = Y9_GPIO_NUM;
+  config.pin_xclk = XCLK_GPIO_NUM;
+  config.pin_pclk = PCLK_GPIO_NUM;
+  config.pin_vsync = VSYNC_GPIO_NUM;
+  config.pin_href = HREF_GPIO_NUM;
+  config.pin_sscb_sda = SIOD_GPIO_NUM;
+  config.pin_sscb_scl = SIOC_GPIO_NUM;
+  config.pin_pwdn = PWDN_GPIO_NUM;
+  config.pin_reset = RESET_GPIO_NUM;
+  config.xclk_freq_hz = 20000000;
+  config.pixel_format = PIXFORMAT_JPEG; 
+  
+  if(psramFound()){
+    config.frame_size = FRAMESIZE_VGA;
+    config.jpeg_quality = 10;
+    config.fb_count = 2;
+  } else {
+    config.frame_size = FRAMESIZE_SVGA;
+    config.jpeg_quality = 12;
+    config.fb_count = 1;
+  }
+  
+  // Camera init
+  esp_err_t err = esp_camera_init(&config);
+  if (err != ESP_OK) {
+    Serial.printf("Camera init failed with error 0x%x", err);
+    return;
+  }
+  // Wi-Fi connection
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("");
+  Serial.println("WiFi connected");
+  
+  Serial.print("Camera Stream Ready! Go to: http://");
+  Serial.println(WiFi.localIP());
+  
+  // Start streaming web server
+  startCameraServer();
+}
+
+void loop() {
+  
+}
